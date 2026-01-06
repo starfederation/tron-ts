@@ -1,5 +1,5 @@
-import { decode, encode } from "./codec";
-import type { DecodeOptions, TronValue } from "./codec";
+import { encode } from "./codec";
+import type { TronValue } from "./codec";
 
 const textDecoder = new TextDecoder();
 
@@ -45,7 +45,11 @@ const parseJSONValue = (value: unknown): TronValue => {
   throw new Error("type");
 };
 
-const stringifyJSONValue = (value: TronValue): string => {
+export const stringifyJSONValue = (value: unknown, undefinedAsNull = false): string => {
+  if (value === undefined) {
+    if (undefinedAsNull) return "null";
+    throw new Error("type");
+  }
   if (value === null) return "null";
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "number") {
@@ -62,15 +66,31 @@ const stringifyJSONValue = (value: TronValue): string => {
     return JSON.stringify(`b64:${btoa(bin)}`);
   }
   if (Array.isArray(value)) {
-    return `[${value.map((entry) => stringifyJSONValue(entry)).join(",")}]`;
+    const length = value.length >>> 0;
+    let out = "[";
+    for (let i = 0; i < length; i++) {
+      if (i > 0) out += ",";
+      out += stringifyJSONValue(value[i], true);
+    }
+    out += "]";
+    return out;
   }
-  const keys = Object.keys(value);
-  const parts = keys.map((key) => {
-    const encodedKey = JSON.stringify(key);
-    const encodedValue = stringifyJSONValue((value as Record<string, TronValue>)[key]);
-    return `${encodedKey}:${encodedValue}`;
-  });
-  return `{${parts.join(",")}}`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    let out = "{";
+    let first = true;
+    for (const key of keys) {
+      const entry = record[key];
+      if (entry === undefined) continue;
+      if (!first) out += ",";
+      first = false;
+      out += `${JSON.stringify(key)}:${stringifyJSONValue(entry)}`;
+    }
+    out += "}";
+    return out;
+  }
+  throw new Error("type");
 };
 
 export const fromJSON = (input: string | Uint8Array): Uint8Array => {
@@ -78,10 +98,4 @@ export const fromJSON = (input: string | Uint8Array): Uint8Array => {
   const parsed = JSON.parse(jsonText) as unknown;
   const value = parseJSONValue(parsed);
   return encode(value);
-};
-
-export const toJSON = (doc: Uint8Array, options: DecodeOptions = {}): string => {
-  const decodeOptions: DecodeOptions = { i64: options.i64 ?? "auto" };
-  const value = decode(doc, decodeOptions);
-  return stringifyJSONValue(value);
 };

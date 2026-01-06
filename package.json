@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "bench": "bun run bench/geojson.ts"
   }
 }

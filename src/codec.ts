@@ -10,14 +10,15 @@ export type TronValue =
   | TronValue[]
   | { [key: string]: TronValue };
 
-export type DocType = "scalar" | "tree";
+export type TronType = "scalar" | "tree";
 
-export type DecodeOptions = {
+export type ViewOptions = {
   i64?: "number" | "bigint" | "auto";
 };
 
+export type PathSegment = string | number;
+
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 const TRAILER_MAGIC = [0x54, 0x52, 0x4f, 0x4e]; // TRON
 const SCALAR_MAGIC = [0x4e, 0x4f, 0x52, 0x54]; // NORT
@@ -563,91 +564,6 @@ export const encode = (value: TronValue): Uint8Array => {
   return out;
 };
 
-const decodeValue = (
-  doc: Uint8Array,
-  offset: number,
-  options: DecodeOptions,
-): [TronValue, number] => {
-  if (offset >= doc.length) throw new Error("tag");
-  const tag = doc[offset];
-  const typ = ((tag >>> 5) & 0x07) as ValueType;
-
-  switch (typ) {
-    case ValueType.Nil:
-      return [null, 1];
-    case ValueType.Bit:
-      return [(tag & 0x01) === 1, 1];
-    case ValueType.I64: {
-      if (offset + 9 > doc.length) throw new Error("short");
-      const value = new DataView(doc.buffer, doc.byteOffset + offset + 1, 8).getBigInt64(
-        0,
-        true,
-      );
-      const mode = options.i64 ?? "auto";
-      if (mode === "bigint") {
-        return [value, 9];
-      }
-      if (value < Number.MIN_SAFE_INTEGER || value > Number.MAX_SAFE_INTEGER) {
-        if (mode === "number") {
-          throw new Error("range");
-        }
-        return [value, 9];
-      }
-      return [Number(value), 9];
-    }
-    case ValueType.F64: {
-      if (offset + 9 > doc.length) throw new Error("short");
-      return [
-        new DataView(doc.buffer, doc.byteOffset + offset + 1, 8).getFloat64(0, true),
-        9,
-      ];
-    }
-    case ValueType.Txt:
-    case ValueType.Bin:
-    case ValueType.Arr:
-    case ValueType.Map: {
-      let length = 0;
-      let n = 0;
-      if ((tag & 0x10) !== 0) {
-        length = tag & 0x0f;
-      } else {
-        n = tag & 0x0f;
-        if (n < 1 || n > 8) throw new Error("len");
-        if (offset + 1 + n > doc.length) {
-          throw new Error("short");
-        }
-        for (let i = 0; i < n; i++) {
-          length += doc[offset + 1 + i] * 2 ** (8 * i);
-        }
-        if (!Number.isSafeInteger(length)) throw new Error("len");
-      }
-      const start = offset + 1 + n;
-      const end = start + length;
-      if (end > doc.length) throw new Error("short");
-      const payload = doc.subarray(start, end);
-      switch (typ) {
-        case ValueType.Txt:
-          return [textDecoder.decode(payload), end - offset];
-        case ValueType.Bin:
-          return [payload.slice(), end - offset];
-        case ValueType.Arr:
-        case ValueType.Map: {
-          if (length === 0 || length > 4) throw new Error("off");
-          let off = 0;
-          for (let i = 0; i < length; i++) {
-            off |= payload[i] << (8 * i);
-          }
-          return [decodeTreeAtOffset(doc, off >>> 0, options), end - offset];
-        }
-      }
-      break;
-    }
-    default:
-      break;
-  }
-  throw new Error("type");
-};
-
 type NodeHeader = {
   nodeLen: number;
   kind: NodeKind;
@@ -655,109 +571,445 @@ type NodeHeader = {
   entryCount: number;
 };
 
-const readNodeHeader = (doc: Uint8Array, offset: number): NodeHeader => {
-  if (offset + 8 > doc.length) throw new Error("short");
-  const raw = readUint32LE(doc, offset);
+const readNodeHeader = (tronBytes: Uint8Array, offset: number): NodeHeader => {
+  if (offset + 8 > tronBytes.length) throw new Error("short");
+  const raw = readUint32LE(tronBytes, offset);
   const kind = (raw & 0x1) as NodeKind;
   const keyType = ((raw >>> 1) & 0x1) as KeyType;
   const nodeLen = raw & ~0x3;
   if (nodeLen < 8 || nodeLen % 4 !== 0) throw new Error("len");
-  const entryCount = readUint32LE(doc, offset + 4);
-  if (offset + nodeLen > doc.length) throw new Error("short");
+  const entryCount = readUint32LE(tronBytes, offset + 4);
+  if (offset + nodeLen > tronBytes.length) throw new Error("short");
   return { nodeLen, kind, keyType, entryCount };
 };
 
-const decodeArrayNode = (
-  doc: Uint8Array,
-  offset: number,
-  baseIndex: number,
-  out: TronValue[],
-  options: DecodeOptions,
-): void => {
-  const header = readNodeHeader(doc, offset);
-  if (header.keyType !== KeyType.Arr) throw new Error("type");
-  const nodeStart = offset + 8;
-  const shift = doc[nodeStart];
-  const bitmap = readUint16LE(doc, nodeStart + 2);
-
-  if (header.kind === NodeKind.Leaf) {
-    let p = nodeStart + 8;
-    for (let slot = 0; slot < 16; slot++) {
-      if (((bitmap >>> slot) & 1) === 0) continue;
-      const [value, size] = decodeValue(doc, p, options);
-      const index = baseIndex + slot;
-      out[index] = value;
-      p += size;
-    }
-    return;
-  }
-
-  let p = nodeStart + 8;
-  for (let slot = 0; slot < 16; slot++) {
-    if (((bitmap >>> slot) & 1) === 0) continue;
-    const childOffset = readUint32LE(doc, p);
-    p += 4;
-    const childBase = baseIndex + slot * (1 << shift);
-    decodeArrayNode(doc, childOffset, childBase, out, options);
-  }
+const popcount16 = (value: number): number => {
+  let v = value & 0xffff;
+  v = v - ((v >>> 1) & 0x5555);
+  v = (v & 0x3333) + ((v >>> 2) & 0x3333);
+  v = (v + (v >>> 4)) & 0x0f0f;
+  v = v + (v >>> 8);
+  return v & 0x1f;
 };
 
-const decodeMapNode = (
-  doc: Uint8Array,
+const readEncodedValue = (
+  tronBytes: Uint8Array,
   offset: number,
-  out: { [key: string]: TronValue },
-  options: DecodeOptions,
-): void => {
-  const header = readNodeHeader(doc, offset);
+): [EncodedValue, number] => {
+  if (offset >= tronBytes.length) throw new Error("tag");
+  const tag = tronBytes[offset];
+  const typ = ((tag >>> 5) & 0x07) as ValueType;
+  switch (typ) {
+    case ValueType.Nil:
+      return [{ type: ValueType.Nil }, 1];
+    case ValueType.Bit:
+      return [{ type: ValueType.Bit, bool: (tag & 0x01) === 1 }, 1];
+    case ValueType.I64: {
+      if (offset + 9 > tronBytes.length) throw new Error("short");
+      const i64 = new DataView(tronBytes.buffer, tronBytes.byteOffset + offset + 1, 8).getBigInt64(
+        0,
+        true,
+      );
+      return [{ type: ValueType.I64, i64 }, 9];
+    }
+    case ValueType.F64: {
+      if (offset + 9 > tronBytes.length) throw new Error("short");
+      const f64 = new DataView(tronBytes.buffer, tronBytes.byteOffset + offset + 1, 8).getFloat64(
+        0,
+        true,
+      );
+      return [{ type: ValueType.F64, f64 }, 9];
+    }
+    case ValueType.Txt:
+    case ValueType.Bin:
+    case ValueType.Arr:
+    case ValueType.Map: {
+      const tag = tronBytes[offset];
+      if ((tag & 0x10) !== 0) {
+        const length = tag & 0x0f;
+        const headerSize = 1;
+        const start = offset + headerSize;
+        const end = start + length;
+        if (end > tronBytes.length) throw new Error("short");
+        const payload = tronBytes.subarray(start, end);
+        if (typ === ValueType.Txt || typ === ValueType.Bin) {
+          return [{ type: typ, bytes: payload }, headerSize + length];
+        }
+        if (length === 0 || length > 4) throw new Error("off");
+        let off = 0;
+        for (let i = 0; i < length; i++) {
+          off |= payload[i] << (8 * i);
+        }
+        return [{ type: typ, offset: off >>> 0 }, headerSize + length];
+      }
+      const n = tag & 0x0f;
+      if (n < 1 || n > 8) throw new Error("len");
+      if (offset + 1 + n > tronBytes.length) throw new Error("short");
+      let length = 0;
+      for (let i = 0; i < n; i++) {
+        length += tronBytes[offset + 1 + i] * 2 ** (8 * i);
+      }
+      if (!Number.isSafeInteger(length)) throw new Error("len");
+      const headerSize = 1 + n;
+      const start = offset + headerSize;
+      const end = start + length;
+      if (end > tronBytes.length) throw new Error("short");
+      const payload = tronBytes.subarray(start, end);
+      if (typ === ValueType.Txt || typ === ValueType.Bin) {
+        return [{ type: typ, bytes: payload }, headerSize + length];
+      }
+      if (length === 0 || length > 4) throw new Error("off");
+      let off = 0;
+      for (let i = 0; i < length; i++) {
+        off |= payload[i] << (8 * i);
+      }
+      return [{ type: typ, offset: off >>> 0 }, headerSize + length];
+    }
+    default:
+      break;
+  }
+  throw new Error("type");
+};
+
+const encodeValueForUpdate = (builder: ByteWriter, value: TronValue): EncodedValue => {
+  const encoded = valueFromAny(value);
+  resolveValueOffset(builder, encoded);
+  return encoded;
+};
+
+const createEmptyContainer = (builder: ByteWriter, type: ValueType): number => {
+  const emptyValue = type === ValueType.Arr ? ([] as TronValue[]) : ({} as TronValue);
+  const encoded = valueFromAny(emptyValue);
+  resolveValueOffset(builder, encoded);
+  return encoded.offset ?? 0;
+};
+
+const appendMapBranchNode = (
+  builder: ByteWriter,
+  bitmap: number,
+  childOffsets: number[],
+): number => {
+  const bodyLen = 4 + 4 * childOffsets.length;
+  const { body, offset } = appendNodeWithBodyLen(
+    builder,
+    NodeKind.Branch,
+    KeyType.Map,
+    childOffsets.length,
+    bodyLen,
+  );
+  writeUint16LE(body, 0, bitmap);
+  body[2] = 0;
+  body[3] = 0;
+  let p = 4;
+  for (const childOffset of childOffsets) {
+    writeUint32LE(body, p, childOffset);
+    p += 4;
+  }
+  return offset;
+};
+
+const appendArrayBranchNode = (
+  builder: ByteWriter,
+  shift: number,
+  bitmap: number,
+  length: number,
+  childOffsets: number[],
+): number => {
+  const bodyLen = 8 + 4 * childOffsets.length;
+  const { body, offset } = appendNodeWithBodyLen(
+    builder,
+    NodeKind.Branch,
+    KeyType.Arr,
+    childOffsets.length,
+    bodyLen,
+  );
+  body[0] = shift & 0xff;
+  body[1] = 0;
+  writeUint16LE(body, 2, bitmap);
+  writeUint32LE(body, 4, length >>> 0);
+  let p = 8;
+  for (const childOffset of childOffsets) {
+    writeUint32LE(body, p, childOffset);
+    p += 4;
+  }
+  return offset;
+};
+
+const setPathAt = (
+  builder: ByteWriter,
+  offset: number,
+  path: PathSegment[],
+  value: TronValue,
+): number => {
+  if (path.length === 0) {
+    const encoded = encodeValueForUpdate(builder, value);
+    if (encoded.type === ValueType.Arr || encoded.type === ValueType.Map) {
+      return encoded.offset ?? 0;
+    }
+    throw new Error("path");
+  }
+  const tronBytes = builder.buf.subarray(0, builder.length);
+  const header = readNodeHeader(tronBytes, offset);
+  if (header.keyType === KeyType.Map) {
+    const key = path[0];
+    if (typeof key !== "string") throw new Error("path");
+    const keyBytes = textEncoder.encode(key);
+    const hash = xxh32(keyBytes, 0);
+    return setMapPath(builder, offset, keyBytes, hash, path.slice(1), value, 0);
+  }
+  if (header.keyType === KeyType.Arr) {
+    const index = path[0];
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+      throw new Error("path");
+    }
+    return setArrayPath(builder, offset, index, path.slice(1), value, true);
+  }
+  throw new Error("type");
+};
+
+const setMapPath = (
+  builder: ByteWriter,
+  offset: number,
+  keyBytes: Uint8Array,
+  hash: number,
+  restPath: PathSegment[],
+  value: TronValue,
+  depth: number,
+): number => {
+  if (depth > maxDepth32) throw new Error("depth");
+  const tronBytes = builder.buf.subarray(0, builder.length);
+  const header = readNodeHeader(tronBytes, offset);
   if (header.keyType !== KeyType.Map) throw new Error("type");
   const nodeStart = offset + 8;
 
   if (header.kind === NodeKind.Leaf) {
     let p = nodeStart;
+    const entries: MapEntry[] = new Array(header.entryCount);
+    let foundIndex = -1;
     for (let i = 0; i < header.entryCount; i++) {
-      const [keyVal, keySize] = decodeValue(doc, p, options);
+      const [keyValue, keySize] = readEncodedValue(tronBytes, p);
+      if (keyValue.type !== ValueType.Txt || !keyValue.bytes) throw new Error("type");
       p += keySize;
-      const [value, valueSize] = decodeValue(doc, p, options);
+      const [entryValue, valueSize] = readEncodedValue(tronBytes, p);
       p += valueSize;
-      out[keyVal] = value;
+      if (keyValue.bytes.length === keyBytes.length) {
+        let matches = true;
+        for (let j = 0; j < keyBytes.length; j++) {
+          if (keyValue.bytes[j] !== keyBytes[j]) {
+            matches = false;
+            break;
+          }
+        }
+        if (matches) foundIndex = i;
+      }
+      entries[i] = {
+        key: keyValue.bytes,
+        value: entryValue,
+        hash: xxh32(keyValue.bytes, 0),
+      };
     }
-    return;
+
+    let nextValue: EncodedValue;
+    if (restPath.length === 0) {
+      nextValue = encodeValueForUpdate(builder, value);
+    } else {
+      const nextSegment = restPath[0];
+      const containerType = typeof nextSegment === "number" ? ValueType.Arr : ValueType.Map;
+      let childOffset: number;
+      if (
+        foundIndex >= 0 &&
+        entries[foundIndex].value.type === containerType &&
+        entries[foundIndex].value.offset !== undefined
+      ) {
+        childOffset = entries[foundIndex].value.offset ?? 0;
+      } else {
+        childOffset = createEmptyContainer(builder, containerType);
+      }
+      const updatedChild = setPathAt(builder, childOffset, restPath, value);
+      nextValue = { type: containerType, offset: updatedChild };
+    }
+
+    if (foundIndex >= 0) {
+      entries[foundIndex] = {
+        key: entries[foundIndex].key,
+        value: nextValue,
+        hash: entries[foundIndex].hash,
+      };
+    } else {
+      entries.push({ key: keyBytes, value: nextValue, hash });
+    }
+
+    const newNode = buildMapNode(entries, depth);
+    return encodeMapNode(builder, newNode);
   }
 
-  const bitmap = readUint16LE(doc, nodeStart);
+  const bitmap = readUint16LE(tronBytes, nodeStart);
+  const slot = (hash >>> (depth * 4)) & 0x0f;
+  const mask = (1 << slot) - 1;
+  const idx = popcount16(bitmap & mask);
+  const hasChild = ((bitmap >>> slot) & 1) === 1;
+  const children: number[] = [];
   let p = nodeStart + 4;
-  for (let slot = 0; slot < 16; slot++) {
-    if (((bitmap >>> slot) & 1) === 0) continue;
-    const childOffset = readUint32LE(doc, p);
+  for (let slotIndex = 0; slotIndex < 16; slotIndex++) {
+    if (((bitmap >>> slotIndex) & 1) === 0) continue;
+    children.push(readUint32LE(tronBytes, p));
     p += 4;
-    decodeMapNode(doc, childOffset, out, options);
   }
+
+  if (hasChild) {
+    const childOffset = children[idx];
+    const newChild = setMapPath(builder, childOffset, keyBytes, hash, restPath, value, depth + 1);
+    children[idx] = newChild;
+    return appendMapBranchNode(builder, bitmap, children);
+  }
+
+  let childValue: EncodedValue;
+  if (restPath.length === 0) {
+    childValue = encodeValueForUpdate(builder, value);
+  } else {
+    const nextSegment = restPath[0];
+    const containerType = typeof nextSegment === "number" ? ValueType.Arr : ValueType.Map;
+    const childOffset = createEmptyContainer(builder, containerType);
+    const updatedChild = setPathAt(builder, childOffset, restPath, value);
+    childValue = { type: containerType, offset: updatedChild };
+  }
+  const newChildNode = buildMapNode([{ key: keyBytes, value: childValue, hash }], depth + 1);
+  const newChildOffset = encodeMapNode(builder, newChildNode);
+  const newBitmap = bitmap | (1 << slot);
+  const newChildren = [...children.slice(0, idx), newChildOffset, ...children.slice(idx)];
+  return appendMapBranchNode(builder, newBitmap, newChildren);
 };
 
-const decodeTreeAtOffset = (
-  doc: Uint8Array,
+const setArrayPath = (
+  builder: ByteWriter,
   offset: number,
-  options: DecodeOptions,
-): TronValue => {
-  const header = readNodeHeader(doc, offset);
-  if (header.keyType === KeyType.Arr) {
-    const nodeStart = offset + 8;
-    const length = readUint32LE(doc, nodeStart + 4);
-    const out = new Array<TronValue>(length);
-    decodeArrayNode(doc, offset, 0, out, options);
-    return out;
+  index: number,
+  restPath: PathSegment[],
+  value: TronValue,
+  isRoot: boolean,
+): number => {
+  const tronBytes = builder.buf.subarray(0, builder.length);
+  const header = readNodeHeader(tronBytes, offset);
+  if (header.keyType !== KeyType.Arr) throw new Error("type");
+  const nodeStart = offset + 8;
+  const shift = tronBytes[nodeStart];
+  const bitmap = readUint16LE(tronBytes, nodeStart + 2);
+  const length = readUint32LE(tronBytes, nodeStart + 4);
+  const nextLength = Math.max(length, index + 1);
+  const nodeLength = isRoot || length !== 0 ? nextLength : length;
+
+  if (header.kind === NodeKind.Leaf) {
+    const slotValues: Array<EncodedValue | undefined> = new Array(16);
+    let p = nodeStart + 8;
+    for (let slot = 0; slot < 16; slot++) {
+      if (((bitmap >>> slot) & 1) === 0) continue;
+      const [entryValue, entrySize] = readEncodedValue(tronBytes, p);
+      p += entrySize;
+      slotValues[slot] = entryValue;
+    }
+
+    let nextValue: EncodedValue;
+    if (restPath.length === 0) {
+      nextValue = encodeValueForUpdate(builder, value);
+    } else {
+      const nextSegment = restPath[0];
+      const containerType = typeof nextSegment === "number" ? ValueType.Arr : ValueType.Map;
+      let childOffset = 0;
+      const existing = slotValues[index & 0x0f];
+      if (existing && existing.type === containerType && existing.offset !== undefined) {
+        childOffset = existing.offset ?? 0;
+      } else {
+        childOffset = createEmptyContainer(builder, containerType);
+      }
+      const updatedChild = setPathAt(builder, childOffset, restPath, value);
+      nextValue = { type: containerType, offset: updatedChild };
+    }
+
+    const slot = index & 0x0f;
+    slotValues[slot] = nextValue;
+    const newBitmap = bitmap | (1 << slot);
+    const values: EncodedValue[] = [];
+    for (let slotIndex = 0; slotIndex < 16; slotIndex++) {
+      if (((newBitmap >>> slotIndex) & 1) === 0) continue;
+      const entry = slotValues[slotIndex];
+      if (!entry) throw new Error("slot");
+      values.push(entry);
+    }
+    const node: ArrayNode = {
+      kind: NodeKind.Leaf,
+      shift,
+      bitmap: newBitmap,
+      length: nodeLength,
+      values,
+    };
+    return encodeArrayNode(builder, node);
   }
-  if (header.keyType === KeyType.Map) {
-    const out: { [key: string]: TronValue } = {};
-    decodeMapNode(doc, offset, out, options);
-    return out;
+
+  const slot = (index >>> shift) & 0x0f;
+  const mask = (1 << slot) - 1;
+  const idx = popcount16(bitmap & mask);
+  const hasChild = ((bitmap >>> slot) & 1) === 1;
+  const children: number[] = [];
+  let p = nodeStart + 8;
+  for (let slotIndex = 0; slotIndex < 16; slotIndex++) {
+    if (((bitmap >>> slotIndex) & 1) === 0) continue;
+    children.push(readUint32LE(tronBytes, p));
+    p += 4;
   }
-  throw new Error("type");
+
+  if (hasChild) {
+    const childOffset = children[idx];
+    const newChild = setArrayPath(builder, childOffset, index, restPath, value, false);
+    children[idx] = newChild;
+    return appendArrayBranchNode(builder, shift, bitmap, nodeLength, children);
+  }
+
+  let childValue: EncodedValue;
+  if (restPath.length === 0) {
+    childValue = encodeValueForUpdate(builder, value);
+  } else {
+    const nextSegment = restPath[0];
+    const containerType = typeof nextSegment === "number" ? ValueType.Arr : ValueType.Map;
+    const childOffset = createEmptyContainer(builder, containerType);
+    const updatedChild = setPathAt(builder, childOffset, restPath, value);
+    childValue = { type: containerType, offset: updatedChild };
+  }
+  const entry: ArrayEntry = { index, value: childValue };
+  const newChildNode = buildArrayNode([entry], shift - 4, 0);
+  const newChildOffset = encodeArrayNode(builder, newChildNode);
+  const newBitmap = bitmap | (1 << slot);
+  const newChildren = [...children.slice(0, idx), newChildOffset, ...children.slice(idx)];
+  return appendArrayBranchNode(builder, shift, newBitmap, nodeLength, newChildren);
 };
 
-export const detectDocType = (doc: Uint8Array): DocType => {
-  if (doc.length < 4) throw new Error("short");
-  const tail = doc.subarray(doc.length - 4);
+export const setPath = (
+  tronBytes: Uint8Array,
+  path: PathSegment[],
+  value: TronValue,
+): Uint8Array => {
+  if (path.length === 0) return encode(value);
+  const tronType = detectType(tronBytes);
+  if (tronType !== "tree") throw new Error("type");
+  const start = tronBytes.length - TRAILER_SIZE;
+  const rootOffset = readUint32LE(tronBytes, start);
+  const builder: ByteWriter = {
+    buf: tronBytes.slice(0, tronBytes.length - TRAILER_SIZE),
+    length: tronBytes.length - TRAILER_SIZE,
+  };
+  const newRoot = setPathAt(builder, rootOffset, path, value);
+  const trailer = new Uint8Array(TRAILER_SIZE);
+  writeUint32LE(trailer, 0, newRoot);
+  writeUint32LE(trailer, 4, rootOffset);
+  trailer.set(TRAILER_MAGIC, 8);
+  ensureCapacity(builder, trailer.length);
+  builder.buf.set(trailer, builder.length);
+  builder.length += trailer.length;
+  return builder.buf.slice(0, builder.length);
+};
+
+export const detectType = (tronBytes: Uint8Array): TronType => {
+  if (tronBytes.length < 4) throw new Error("short");
+  const tail = tronBytes.subarray(tronBytes.length - 4);
   if (
     tail[0] === SCALAR_MAGIC[0] &&
     tail[1] === SCALAR_MAGIC[1] &&
@@ -772,25 +1024,21 @@ export const detectDocType = (doc: Uint8Array): DocType => {
     tail[2] === TRAILER_MAGIC[2] &&
     tail[3] === TRAILER_MAGIC[3]
   ) {
-    if (doc.length < TRAILER_SIZE) throw new Error("short");
+    if (tronBytes.length < TRAILER_SIZE) throw new Error("short");
     return "tree";
   }
   throw new Error("type");
 };
 
-export const decode = (doc: Uint8Array, options: DecodeOptions = {}): TronValue => {
-  const docType = detectDocType(doc);
-  if (docType === "scalar") {
-    if (doc.length < 4) throw new Error("short");
-    const payload = doc.subarray(0, doc.length - 4);
-    const [value, size] = decodeValue(payload, 0, options);
-    if (size !== payload.length) throw new Error("extra");
-    return value;
+export const vacuum = (tronBytes: Uint8Array): Uint8Array => {
+  const tronType = detectType(tronBytes);
+  if (tronType === "scalar") {
+    return tronBytes.slice();
   }
-
-  const start = doc.length - TRAILER_SIZE;
-  const rootOffset = readUint32LE(doc, start);
-  const magic = doc.subarray(doc.length - 4);
+  if (tronBytes.length < TRAILER_SIZE) throw new Error("short");
+  const start = tronBytes.length - TRAILER_SIZE;
+  const rootOffset = readUint32LE(tronBytes, start);
+  const magic = tronBytes.subarray(tronBytes.length - 4);
   if (
     magic[0] !== TRAILER_MAGIC[0] ||
     magic[1] !== TRAILER_MAGIC[1] ||
@@ -799,5 +1047,337 @@ export const decode = (doc: Uint8Array, options: DecodeOptions = {}): TronValue 
   ) {
     throw new Error("magic");
   }
-  return decodeTreeAtOffset(doc, rootOffset, options);
+
+  const builder: ByteWriter = { buf: new Uint8Array(0), length: 0 };
+  const offsets = new Map<number, number>();
+  type Patch = { pos: number; len: number; value: number };
+  let copyNode: (offset: number) => number;
+
+  const scanValueAt = (
+    oldPos: number,
+    nodeOffset: number,
+    patchOffsets: boolean,
+    patches: Patch[],
+  ): number => {
+    if (oldPos >= tronBytes.length) throw new Error("tag");
+    const tag = tronBytes[oldPos];
+    const typ = ((tag >>> 5) & 0x07) as ValueType;
+    switch (typ) {
+      case ValueType.Nil:
+      case ValueType.Bit:
+        return 1;
+      case ValueType.I64:
+      case ValueType.F64:
+        if (oldPos + 9 > tronBytes.length) throw new Error("short");
+        return 9;
+      case ValueType.Txt:
+      case ValueType.Bin:
+      case ValueType.Arr:
+      case ValueType.Map: {
+        let length = 0;
+        let headerSize = 1;
+        if ((tag & 0x10) !== 0) {
+          length = tag & 0x0f;
+        } else {
+          const n = tag & 0x0f;
+          if (n < 1 || n > 8) throw new Error("len");
+          if (oldPos + 1 + n > tronBytes.length) throw new Error("short");
+          for (let i = 0; i < n; i++) {
+            length += tronBytes[oldPos + 1 + i] * 2 ** (8 * i);
+          }
+          if (!Number.isSafeInteger(length)) throw new Error("len");
+          headerSize = 1 + n;
+        }
+        const start = oldPos + headerSize;
+        const end = start + length;
+        if (end > tronBytes.length) throw new Error("short");
+        if ((typ === ValueType.Arr || typ === ValueType.Map) && patchOffsets) {
+          if (length === 0 || length > 4) throw new Error("off");
+          let childOffset = 0;
+          for (let i = 0; i < length; i++) {
+            childOffset |= tronBytes[start + i] << (8 * i);
+          }
+          const newChildOffset = copyNode(childOffset >>> 0);
+          patches.push({ pos: start - nodeOffset, len: length, value: newChildOffset });
+        }
+        return headerSize + length;
+      }
+      default:
+        throw new Error("type");
+    }
+  };
+
+  copyNode = (offset: number): number => {
+    const cached = offsets.get(offset);
+    if (cached !== undefined) return cached;
+    if (offset + 8 > tronBytes.length) throw new Error("short");
+    const raw = readUint32LE(tronBytes, offset);
+    const kind = (raw & 0x1) as NodeKind;
+    const keyType = ((raw >>> 1) & 0x1) as KeyType;
+    const nodeLen = raw & ~0x3;
+    const entryCount = readUint32LE(tronBytes, offset + 4);
+    if (nodeLen < 8 || nodeLen % 4 !== 0) throw new Error("len");
+    if (offset + nodeLen > tronBytes.length) throw new Error("short");
+
+    const nodeStart = offset + 8;
+    const patches: Patch[] = [];
+
+    if (keyType === KeyType.Arr) {
+      if (kind === NodeKind.Leaf) {
+        const bitmap = readUint16LE(tronBytes, nodeStart + 2);
+        let p = nodeStart + 8;
+        for (let slot = 0; slot < 16; slot++) {
+          if (((bitmap >>> slot) & 1) === 0) continue;
+          const size = scanValueAt(p, offset, true, patches);
+          p += size;
+        }
+      } else {
+        let p = nodeStart + 8;
+        for (let i = 0; i < entryCount; i++) {
+          const childOffset = readUint32LE(tronBytes, p);
+          const newChildOffset = copyNode(childOffset);
+          patches.push({ pos: p - offset, len: 4, value: newChildOffset });
+          p += 4;
+        }
+      }
+    } else if (keyType === KeyType.Map) {
+      if (kind === NodeKind.Leaf) {
+        let p = nodeStart;
+        for (let i = 0; i < entryCount; i++) {
+          const keySize = scanValueAt(p, offset, false, patches);
+          p += keySize;
+          const valueSize = scanValueAt(p, offset, true, patches);
+          p += valueSize;
+        }
+      } else {
+        let p = nodeStart + 4;
+        for (let i = 0; i < entryCount; i++) {
+          const childOffset = readUint32LE(tronBytes, p);
+          const newChildOffset = copyNode(childOffset);
+          patches.push({ pos: p - offset, len: 4, value: newChildOffset });
+          p += 4;
+        }
+      }
+    } else {
+      throw new Error("type");
+    }
+
+    ensureCapacity(builder, nodeLen);
+    const newOffset = builder.length;
+    builder.buf.set(tronBytes.subarray(offset, offset + nodeLen), newOffset);
+    builder.length += nodeLen;
+
+    for (const patch of patches) {
+      const at = newOffset + patch.pos;
+      const value = patch.value >>> 0;
+      builder.buf[at] = value & 0xff;
+      if (patch.len > 1) builder.buf[at + 1] = (value >>> 8) & 0xff;
+      if (patch.len > 2) builder.buf[at + 2] = (value >>> 16) & 0xff;
+      if (patch.len > 3) builder.buf[at + 3] = (value >>> 24) & 0xff;
+    }
+
+    offsets.set(offset, newOffset);
+    return newOffset;
+  };
+
+  const newRootOffset = copyNode(rootOffset);
+  const trailer = new Uint8Array(TRAILER_SIZE);
+  writeUint32LE(trailer, 0, newRootOffset);
+  writeUint32LE(trailer, 4, 0);
+  trailer.set(TRAILER_MAGIC, 8);
+  ensureCapacity(builder, trailer.length);
+  builder.buf.set(trailer, builder.length);
+  builder.length += trailer.length;
+  return builder.buf.slice(0, builder.length);
+};
+
+export const canonical = (tronBytes: Uint8Array): Uint8Array => {
+  const tronType = detectType(tronBytes);
+
+  const decodeEncodedValueAt = (offset: number): [EncodedValue, number] => {
+    if (offset >= tronBytes.length) throw new Error("tag");
+    const tag = tronBytes[offset];
+    const typ = ((tag >>> 5) & 0x07) as ValueType;
+    switch (typ) {
+      case ValueType.Nil:
+        return [{ type: ValueType.Nil }, 1];
+      case ValueType.Bit:
+        return [{ type: ValueType.Bit, bool: (tag & 0x01) === 1 }, 1];
+      case ValueType.I64: {
+        if (offset + 9 > tronBytes.length) throw new Error("short");
+        const i64 = new DataView(tronBytes.buffer, tronBytes.byteOffset + offset + 1, 8).getBigInt64(
+          0,
+          true,
+        );
+        return [{ type: ValueType.I64, i64 }, 9];
+      }
+      case ValueType.F64: {
+        if (offset + 9 > tronBytes.length) throw new Error("short");
+        const f64 = new DataView(tronBytes.buffer, tronBytes.byteOffset + offset + 1, 8).getFloat64(
+          0,
+          true,
+        );
+        return [{ type: ValueType.F64, f64 }, 9];
+      }
+      case ValueType.Txt:
+      case ValueType.Bin:
+      case ValueType.Arr:
+      case ValueType.Map: {
+        let length = 0;
+        let headerSize = 1;
+        if ((tag & 0x10) !== 0) {
+          length = tag & 0x0f;
+        } else {
+          const n = tag & 0x0f;
+          if (n < 1 || n > 8) throw new Error("len");
+          if (offset + 1 + n > tronBytes.length) throw new Error("short");
+          for (let i = 0; i < n; i++) {
+            length += tronBytes[offset + 1 + i] * 2 ** (8 * i);
+          }
+          if (!Number.isSafeInteger(length)) throw new Error("len");
+          headerSize = 1 + n;
+        }
+        const start = offset + headerSize;
+        const end = start + length;
+        if (end > tronBytes.length) throw new Error("short");
+        if (typ === ValueType.Txt || typ === ValueType.Bin) {
+          return [{ type: typ, bytes: tronBytes.subarray(start, end) }, headerSize + length];
+        }
+        if (length === 0 || length > 4) throw new Error("off");
+        let childOffset = 0;
+        for (let i = 0; i < length; i++) {
+          childOffset |= tronBytes[start + i] << (8 * i);
+        }
+        const treeValue = decodeTreeValueAt(childOffset >>> 0);
+        if (treeValue.type !== typ || !treeValue.node) throw new Error("type");
+        return [{ type: typ, node: treeValue.node }, headerSize + length];
+      }
+      default:
+        throw new Error("type");
+    }
+  };
+
+  const decodeTreeValueAt = (offset: number): EncodedValue => {
+    const header = readNodeHeader(tronBytes, offset);
+    if (header.keyType === KeyType.Arr) {
+      const nodeStart = offset + 8;
+      const length = readUint32LE(tronBytes, nodeStart + 4);
+      const entriesByIndex = new Map<number, EncodedValue>();
+      const collectArrayEntriesAt = (nodeOffset: number, baseIndex: number): void => {
+        const nodeHeader = readNodeHeader(tronBytes, nodeOffset);
+        if (nodeHeader.keyType !== KeyType.Arr) throw new Error("type");
+        const start = nodeOffset + 8;
+        const shift = tronBytes[start];
+        const bitmap = readUint16LE(tronBytes, start + 2);
+        if (nodeHeader.kind === NodeKind.Leaf) {
+          let p = start + 8;
+          for (let slot = 0; slot < 16; slot++) {
+            if (((bitmap >>> slot) & 1) === 0) continue;
+            const [value, size] = decodeEncodedValueAt(p);
+            const index = baseIndex + slot;
+            entriesByIndex.set(index, value);
+            p += size;
+          }
+          return;
+        }
+        let p = start + 8;
+        for (let slot = 0; slot < 16; slot++) {
+          if (((bitmap >>> slot) & 1) === 0) continue;
+          const childOffset = readUint32LE(tronBytes, p);
+          p += 4;
+          const childBase = baseIndex + slot * (1 << shift);
+          collectArrayEntriesAt(childOffset, childBase);
+        }
+      };
+      collectArrayEntriesAt(offset, 0);
+      for (const index of entriesByIndex.keys()) {
+        if (index >= length) throw new Error("len");
+      }
+      const entries: ArrayEntry[] = new Array(length);
+      for (let i = 0; i < length; i++) {
+        entries[i] = { index: i, value: entriesByIndex.get(i) ?? { type: ValueType.Nil } };
+      }
+      let shift = 0;
+      if (length > 0) {
+        let maxIndex = length - 1;
+        while ((maxIndex >>> shift) > 0x0f) {
+          shift += 4;
+        }
+      }
+      const node = buildArrayNode(entries, shift, length);
+      return { type: ValueType.Arr, node };
+    }
+    if (header.keyType === KeyType.Map) {
+      const entries: MapEntry[] = [];
+      const collectMapEntriesAt = (nodeOffset: number): void => {
+        const nodeHeader = readNodeHeader(tronBytes, nodeOffset);
+        if (nodeHeader.keyType !== KeyType.Map) throw new Error("type");
+        const start = nodeOffset + 8;
+        if (nodeHeader.kind === NodeKind.Leaf) {
+          let p = start;
+          for (let i = 0; i < nodeHeader.entryCount; i++) {
+            const [keyValue, keySize] = decodeEncodedValueAt(p);
+            if (keyValue.type !== ValueType.Txt) throw new Error("type");
+            const keyBytes = keyValue.bytes ?? new Uint8Array();
+            p += keySize;
+            const [value, valueSize] = decodeEncodedValueAt(p);
+            p += valueSize;
+            entries.push({ key: keyBytes, value, hash: xxh32(keyBytes, 0) });
+          }
+          return;
+        }
+        const bitmap = readUint16LE(tronBytes, start);
+        let p = start + 4;
+        for (let slot = 0; slot < 16; slot++) {
+          if (((bitmap >>> slot) & 1) === 0) continue;
+          const childOffset = readUint32LE(tronBytes, p);
+          p += 4;
+          collectMapEntriesAt(childOffset);
+        }
+      };
+      collectMapEntriesAt(offset);
+      const node = buildMapNode(entries, 0);
+      return { type: ValueType.Map, node };
+    }
+    throw new Error("type");
+  };
+
+  if (tronType === "scalar") {
+    if (tronBytes.length < 4) throw new Error("short");
+    const payload = tronBytes.subarray(0, tronBytes.length - 4);
+    const [value, size] = decodeEncodedValueAt(0);
+    if (value.type === ValueType.Arr || value.type === ValueType.Map) throw new Error("type");
+    if (size !== payload.length) throw new Error("extra");
+    const encoded = new Uint8Array(encodedValueLen(value));
+    writeValue(encoded, 0, value);
+    const out = new Uint8Array(encoded.length + 4);
+    out.set(encoded, 0);
+    out.set(SCALAR_MAGIC, encoded.length);
+    return out;
+  }
+
+  if (tronBytes.length < TRAILER_SIZE) throw new Error("short");
+  const start = tronBytes.length - TRAILER_SIZE;
+  const rootOffset = readUint32LE(tronBytes, start);
+  const magic = tronBytes.subarray(tronBytes.length - 4);
+  if (
+    magic[0] !== TRAILER_MAGIC[0] ||
+    magic[1] !== TRAILER_MAGIC[1] ||
+    magic[2] !== TRAILER_MAGIC[2] ||
+    magic[3] !== TRAILER_MAGIC[3]
+  ) {
+    throw new Error("magic");
+  }
+
+  const rootValue = decodeTreeValueAt(rootOffset);
+  const builder: ByteWriter = { buf: new Uint8Array(0), length: 0 };
+  resolveValueOffset(builder, rootValue);
+  const trailer = new Uint8Array(TRAILER_SIZE);
+  writeUint32LE(trailer, 0, rootValue.offset ?? 0);
+  writeUint32LE(trailer, 4, 0);
+  trailer.set(TRAILER_MAGIC, 8);
+  ensureCapacity(builder, trailer.length);
+  builder.buf.set(trailer, builder.length);
+  builder.length += trailer.length;
+  return builder.buf.slice(0, builder.length);
 };
