@@ -20,28 +20,44 @@ const nowNs = (): bigint => process.hrtime.bigint();
 const fixtureUrl = new URL("../tron-shared/shared/testdata/geojson_large.json", import.meta.url);
 const baseJsonText = readFileSync(fixtureUrl, "utf8");
 const baseValue = JSON.parse(baseJsonText) as any;
-const scale = Number(process.env.TRON_BENCH_SCALE ?? "10");
-let jsonValue = baseValue;
-if (Number.isInteger(scale) && scale > 1) {
-  const features = Array.isArray(baseValue?.features) ? baseValue.features : null;
-  if (features) {
-    const scaled = { ...baseValue, features: [] as unknown[] };
-    for (let i = 0; i < scale; i++) {
-      for (const feature of features) {
-        const cloned =
-          typeof structuredClone === "function"
-            ? structuredClone(feature)
-            : JSON.parse(JSON.stringify(feature));
-        scaled.features.push(cloned);
-      }
+const textEncoder = new TextEncoder();
+
+const scaleGeoJSON = (value: any, scaleFactor: number): any => {
+  if (!Number.isInteger(scaleFactor) || scaleFactor <= 1) return value;
+  const features = Array.isArray(value?.features) ? value.features : null;
+  if (!features) return value;
+  const scaled = { ...value, features: [] as unknown[] };
+  for (let i = 0; i < scaleFactor; i++) {
+    for (const feature of features) {
+      const cloned =
+        typeof structuredClone === "function"
+          ? structuredClone(feature)
+          : JSON.parse(JSON.stringify(feature));
+      scaled.features.push(cloned);
     }
-    jsonValue = scaled;
   }
-}
-const jsonText = JSON.stringify(jsonValue);
-const jsonBytes = new TextEncoder().encode(jsonText);
+  return scaled;
+};
+
+const makeJsonPayload = (value: any): { text: string; bytes: Uint8Array } => {
+  const text = JSON.stringify(value);
+  return { text, bytes: textEncoder.encode(text) };
+};
+
+const scale = Number(process.env.TRON_BENCH_SCALE ?? "10");
+const jsonValue = scaleGeoJSON(baseValue, scale);
+const jsonPayload = makeJsonPayload(jsonValue);
+const jsonText = jsonPayload.text;
+const jsonBytes = jsonPayload.bytes;
+
+const targetLargeBytes = 1_000_000;
+const basePayload = makeJsonPayload(scaleGeoJSON(baseValue, 1));
+const estimatedScale = Math.max(1, Math.round(targetLargeBytes / basePayload.bytes.length));
+const largeJsonValue = scaleGeoJSON(baseValue, estimatedScale);
+const largeJsonPayload = makeJsonPayload(largeJsonValue);
 
 const tronBytes = encode(jsonValue as never);
+const tronLargeBytes = encode(largeJsonValue as never);
 const tronUpdatedBytes = (() => {
   const value = tron(tronBytes) as any;
   if (value?.features?.[0]?.properties) {
@@ -56,6 +72,14 @@ const tronUpdatedProxy = tron(tronUpdatedBytes) as {
 };
 const tronVacuumBytes = tronUpdatedProxy.vacuum();
 const tronCanonicalBytes = tronUpdatedProxy.canonical();
+const tronLargeUpdatedBytes = (() => {
+  const value = tron(tronLargeBytes) as any;
+  if (value?.features?.[0]?.properties) {
+    value.features[0].properties.elevation = 1500;
+  }
+  return readTronBytes(value);
+})();
+const tronLargeUpdateBytesLen = tronLargeUpdatedBytes.length;
 
 const jsonUpdate = (() => {
   const value = JSON.parse(jsonText) as any;
@@ -63,10 +87,22 @@ const jsonUpdate = (() => {
     value.features[0].properties.elevation = 1500;
   }
   const updatedText = JSON.stringify(value);
-  const updatedBytes = new TextEncoder().encode(updatedText);
+  const updatedBytes = textEncoder.encode(updatedText);
   return { text: updatedText, bytes: updatedBytes };
 })();
 const jsonUpdateBytesLen = jsonUpdate.bytes.length;
+const jsonUpdateSizeKb = Math.ceil(jsonUpdateBytesLen / 1024);
+const jsonUpdateLabel = `proxy update elevation (${jsonUpdateSizeKb}KB)`;
+const jsonLargeUpdate = (() => {
+  const value = JSON.parse(largeJsonPayload.text) as any;
+  if (value?.features?.[0]?.properties) {
+    value.features[0].properties.elevation = 1500;
+  }
+  const updatedText = JSON.stringify(value);
+  const updatedBytes = textEncoder.encode(updatedText);
+  return { text: updatedText, bytes: updatedBytes };
+})();
+const jsonLargeUpdateBytesLen = jsonLargeUpdate.bytes.length;
 
 const readPath = (value: any) => {
   const feature = value.features?.[0];
@@ -99,7 +135,7 @@ const benchPairs: BenchPair[] = [
     },
   },
   {
-    name: "proxy update elevation",
+    name: jsonUpdateLabel,
     tron: {
       bytesPerIter: tronUpdateBytesLen,
       fn: () => {
@@ -115,6 +151,31 @@ const benchPairs: BenchPair[] = [
       bytesPerIter: jsonUpdateBytesLen,
       fn: () => {
         const value = JSON.parse(jsonText) as any;
+        if (value?.features?.[0]?.properties) {
+          value.features[0].properties.elevation = 1500;
+        }
+        sink = JSON.stringify(value);
+        return sink;
+      },
+    },
+  },
+  {
+    name: "proxy update elevation (1MB)",
+    tron: {
+      bytesPerIter: tronLargeUpdateBytesLen,
+      fn: () => {
+        const value = tron(tronLargeBytes) as any;
+        if (value?.features?.[0]?.properties) {
+          value.features[0].properties.elevation = 1500;
+        }
+        sink = readTronBytes(value);
+        return sink;
+      },
+    },
+    json: {
+      bytesPerIter: jsonLargeUpdateBytesLen,
+      fn: () => {
+        const value = JSON.parse(largeJsonPayload.text) as any;
         if (value?.features?.[0]?.properties) {
           value.features[0].properties.elevation = 1500;
         }
@@ -200,6 +261,9 @@ console.log("GeoJSON benchmark fixture:");
 console.log(`- Scale: ${scale}x`);
 console.log(`- JSON bytes: ${jsonBytes.length}`);
 console.log(`- TRON bytes: ${tronBytes.length}`);
+console.log(`- Large scale (target ~1MB): ${estimatedScale}x`);
+console.log(`- Large JSON bytes: ${largeJsonPayload.bytes.length}`);
+console.log(`- Large TRON bytes: ${tronLargeBytes.length}`);
 console.log("");
 
 for (const pair of benchPairs) {

@@ -120,6 +120,7 @@ bun run bench
 ```
 
 Fixture sizes (scale 10x): JSON 12,071 bytes, TRON 25,656 bytes.
+Large scale (~1MB): JSON 967,253 bytes, TRON 2,092,484 bytes.
 Update benchmarks change `features[0].properties.elevation` to `1500`.
 TRON updates use proxy assignment plus `tronBytes(proxy)`; JSON updates use parse + modify + stringify.
 Vacuum/canonical benchmarks run against bytes after a single update (history present).
@@ -129,13 +130,14 @@ Sample results (bun 1.2.20, Linux x86_64):
 
 | Test | TRON MB/s | JSON MB/s |
 | --- | --- | --- |
-| proxy + read | 3712.86 | 299.22 |
-| proxy update elevation | 1062.13 | 167.45 |
-| vacuum (history-free bytes) | 150.14 | 168.95 |
-| canonical (spec bytes) | 32.60 | 164.06 |
+| proxy + read | 3459.94 | 285.92 |
+| proxy update elevation (12KB) | 1043.66 | 163.63 |
+| proxy update elevation (1MB) | 2591.83 | 202.09 |
+| vacuum (history-free bytes) | 155.98 | 169.02 |
+| canonical (spec bytes) | 37.74 | 164.81 |
 
-JSON column corresponds to parse + read, parse + modify + stringify, parse + stringify (updated JSON),
-and parse + stringify (updated JSON).
+JSON column corresponds to parse + read, parse + modify + stringify, parse + modify + stringify (1MB),
+parse + stringify (updated JSON), and parse + stringify (updated JSON).
 
 Results vary by machine; rerun `bun run bench` to refresh.
 
