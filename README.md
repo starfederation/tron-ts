@@ -1,3 +1,5 @@
+![tron-ts logo](assets/logo.png)
+
 # TRON TypeScript implementation
 
 This package provides a TypeScript implementation of the TRON encoder and lazy proxy
