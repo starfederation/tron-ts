@@ -24,8 +24,9 @@ export type TronProxy<T extends TronValue = TronValue> = T extends Uint8Array
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
 
-const SCALAR_MAGIC = [0x4e, 0x4f, 0x52, 0x54]; // NORT
-const TRAILER_SIZE = 12;
+const MAGIC = [0x54, 0x52, 0x4f, 0x4e]; // TRON
+const HEADER_SIZE = 4;
+const FOOTER_SIZE = 8;
 
 enum ValueType {
   Nil = 0,
@@ -36,16 +37,6 @@ enum ValueType {
   Bin = 5,
   Arr = 6,
   Map = 7,
-}
-
-enum NodeKind {
-  Branch = 0,
-  Leaf = 1,
-}
-
-enum KeyType {
-  Arr = 0,
-  Map = 1,
 }
 
 const MISSING = Symbol("missing");
@@ -117,33 +108,46 @@ const toArrayIndex = (prop: string): number | null => {
 };
 
 type NodeHeader = {
+  type: ValueType.Arr | ValueType.Map;
+  isLeaf: boolean;
+  isRoot: boolean;
   nodeLen: number;
-  kind: NodeKind;
-  keyType: KeyType;
-  entryCount: number;
+  headerSize: number;
 };
 
 const readNodeHeader = (tronBytes: Uint8Array, offset: number): NodeHeader => {
-  if (offset + 8 > tronBytes.length) throw new Error("short");
-  const raw = readUint32LE(tronBytes, offset);
-  const kind = (raw & 0x1) as NodeKind;
-  const keyType = ((raw >>> 1) & 0x1) as KeyType;
-  const nodeLen = raw & ~0x3;
-  if (nodeLen < 8 || nodeLen % 4 !== 0) throw new Error("len");
-  const entryCount = readUint32LE(tronBytes, offset + 4);
+  if (offset >= tronBytes.length) throw new Error("tag");
+  const tag = tronBytes[offset];
+  const type = (tag & 0x07) as ValueType;
+  if (type !== ValueType.Arr && type !== ValueType.Map) throw new Error("type");
+  const lenBytes = ((tag >>> 4) & 0x03) + 1;
+  const headerSize = 1 + lenBytes;
+  if (offset + headerSize > tronBytes.length) throw new Error("short");
+  let nodeLen = 0;
+  for (let i = 0; i < lenBytes; i++) {
+    nodeLen |= tronBytes[offset + 1 + i] << (8 * i);
+  }
+  if (nodeLen < headerSize) throw new Error("len");
   if (offset + nodeLen > tronBytes.length) throw new Error("short");
-  return { nodeLen, kind, keyType, entryCount };
+  return {
+    type: type as ValueType.Arr | ValueType.Map,
+    isLeaf: (tag & 0x08) !== 0,
+    isRoot: type === ValueType.Arr ? (tag & 0x40) === 0 : false,
+    nodeLen,
+    headerSize,
+  };
 };
 
-const readLength = (
+const readBytesLength = (
   tronBytes: Uint8Array,
   offset: number,
 ): { length: number; headerSize: number } => {
+  if (offset >= tronBytes.length) throw new Error("tag");
   const tag = tronBytes[offset];
-  if ((tag & 0x10) !== 0) {
-    return { length: tag & 0x0f, headerSize: 1 };
-  }
-  const n = tag & 0x0f;
+  const isPacked = (tag & 0x08) !== 0;
+  const nibble = tag >>> 4;
+  if (isPacked) return { length: nibble, headerSize: 1 };
+  const n = nibble;
   if (n < 1 || n > 8) throw new Error("len");
   if (offset + 1 + n > tronBytes.length) throw new Error("short");
   let length = 0;
@@ -154,93 +158,21 @@ const readLength = (
   return { length, headerSize: 1 + n };
 };
 
-const skipValueAt = (tronBytes: Uint8Array, offset: number): number => {
+const readValueTypeAt = (tronBytes: Uint8Array, offset: number): ValueType => {
   if (offset >= tronBytes.length) throw new Error("tag");
-  const tag = tronBytes[offset];
-  const typ = ((tag >>> 5) & 0x07) as ValueType;
-  switch (typ) {
-    case ValueType.Nil:
-    case ValueType.Bit:
-      return 1;
-    case ValueType.I64:
-    case ValueType.F64:
-      return 9;
-    case ValueType.Txt:
-    case ValueType.Bin:
-    case ValueType.Arr:
-    case ValueType.Map: {
-      const { length, headerSize } = readLength(tronBytes, offset);
-      const end = offset + headerSize + length;
-      if (end > tronBytes.length) throw new Error("short");
-      return headerSize + length;
-    }
-    default:
-      throw new Error("type");
-  }
+  return (tronBytes[offset] & 0x07) as ValueType;
 };
 
-type EncodedValue = {
-  type: ValueType;
-  bool?: boolean;
-  i64?: bigint;
-  f64?: number;
-  bytes?: Uint8Array;
-  offset?: number;
-};
-
-const readEncodedValue = (
-  tronBytes: Uint8Array,
-  offset: number,
-): [EncodedValue, number] => {
+const readTxtBytesAt = (tronBytes: Uint8Array, offset: number): Uint8Array => {
   if (offset >= tronBytes.length) throw new Error("tag");
   const tag = tronBytes[offset];
-  const typ = ((tag >>> 5) & 0x07) as ValueType;
-  switch (typ) {
-    case ValueType.Nil:
-      return [{ type: ValueType.Nil }, 1];
-    case ValueType.Bit:
-      return [{ type: ValueType.Bit, bool: (tag & 0x01) === 1 }, 1];
-    case ValueType.I64: {
-      if (offset + 9 > tronBytes.length) throw new Error("short");
-      const i64 = new DataView(
-        tronBytes.buffer,
-        tronBytes.byteOffset + offset + 1,
-        8,
-      ).getBigInt64(0, true);
-      return [{ type: ValueType.I64, i64 }, 9];
-    }
-    case ValueType.F64: {
-      if (offset + 9 > tronBytes.length) throw new Error("short");
-      const f64 = new DataView(
-        tronBytes.buffer,
-        tronBytes.byteOffset + offset + 1,
-        8,
-      ).getFloat64(0, true);
-      return [{ type: ValueType.F64, f64 }, 9];
-    }
-    case ValueType.Txt:
-    case ValueType.Bin:
-    case ValueType.Arr:
-    case ValueType.Map: {
-      const { length, headerSize } = readLength(tronBytes, offset);
-      const start = offset + headerSize;
-      const end = start + length;
-      if (end > tronBytes.length) throw new Error("short");
-      const payload = tronBytes.subarray(start, end);
-      if (typ === ValueType.Txt || typ === ValueType.Bin) {
-        return [{ type: typ, bytes: payload }, headerSize + length];
-      }
-      if (length === 0 || length > 4) throw new Error("off");
-      let off = 0;
-      for (let i = 0; i < length; i++) {
-        off |= payload[i] << (8 * i);
-      }
-      return [{ type: typ, offset: off >>> 0 }, headerSize + length];
-    }
-    default:
-      break;
-  }
-  throw new Error("type");
+  const type = (tag & 0x07) as ValueType;
+  if (type !== ValueType.Txt) throw new Error("type");
+  const { length, headerSize } = readBytesLength(tronBytes, offset);
+  const start = offset + headerSize;
+  const end = start + length;
+  if (end > tronBytes.length) throw new Error("short");
+  return tronBytes.subarray(start, end);
 };
 
 const ensureCacheFresh = (state: ArrayState | MapState): void => {
@@ -255,8 +187,14 @@ const ensureCacheFresh = (state: ArrayState | MapState): void => {
 };
 
 const getRootOffset = (tronBytes: Uint8Array): number => {
-  const start = tronBytes.length - TRAILER_SIZE;
-  return readUint32LE(tronBytes, start);
+  if (tronBytes.length < HEADER_SIZE + FOOTER_SIZE) throw new Error("short");
+  for (let i = 0; i < MAGIC.length; i++) {
+    if (tronBytes[i] !== MAGIC[i]) throw new Error("magic");
+  }
+  const footerStart = tronBytes.length - FOOTER_SIZE;
+  const rootOffset = readUint32LE(tronBytes, footerStart);
+  if (rootOffset < HEADER_SIZE || rootOffset >= footerStart) throw new Error("off");
+  return rootOffset;
 };
 
 const getContainerOffset = (state: ArrayState | MapState): number | null => {
@@ -264,13 +202,13 @@ const getContainerOffset = (state: ArrayState | MapState): number | null => {
   if (state.offsetCache !== undefined) return state.offsetCache;
   const tronBytes = state.root.tronBytes;
   let offset = getRootOffset(tronBytes);
-  let header = readNodeHeader(tronBytes, offset);
   if (state.path.length === 0) {
-    if (state.kind === "array" && header.keyType !== KeyType.Arr) {
+    const type = readValueTypeAt(tronBytes, offset);
+    if (state.kind === "array" && type !== ValueType.Arr) {
       state.offsetCache = null;
       return null;
     }
-    if (state.kind === "map" && header.keyType !== KeyType.Map) {
+    if (state.kind === "map" && type !== ValueType.Map) {
       state.offsetCache = null;
       return null;
     }
@@ -278,49 +216,52 @@ const getContainerOffset = (state: ArrayState | MapState): number | null => {
     return state.offsetCache;
   }
   for (const segment of state.path) {
-    if (header.keyType === KeyType.Map) {
+    const type = readValueTypeAt(tronBytes, offset);
+    if (type === ValueType.Map) {
       if (typeof segment !== "string") {
         state.offsetCache = null;
         return null;
       }
       const keyBytes = textEncoder.encode(segment);
       const hash = xxh32(keyBytes, 0);
-      const encoded = lookupMapEncodedAt(tronBytes, offset, keyBytes, hash, 0);
-      if (!encoded || encoded.offset === undefined) {
+      const valueOffset = lookupMapValueOffsetAt(tronBytes, offset, keyBytes, hash, 0);
+      if (valueOffset === undefined) {
         state.offsetCache = null;
         return null;
       }
-      if (encoded.type !== ValueType.Arr && encoded.type !== ValueType.Map) {
+      const nextType = readValueTypeAt(tronBytes, valueOffset);
+      if (nextType !== ValueType.Arr && nextType !== ValueType.Map) {
         state.offsetCache = null;
         return null;
       }
-      offset = encoded.offset;
-    } else if (header.keyType === KeyType.Arr) {
+      offset = valueOffset;
+    } else if (type === ValueType.Arr) {
       if (typeof segment !== "number" || !Number.isInteger(segment) || segment < 0) {
         state.offsetCache = null;
         return null;
       }
-      const encoded = lookupArrayEncodedAt(tronBytes, offset, segment);
-      if (!encoded || encoded.offset === undefined) {
+      const valueOffset = lookupArrayValueOffsetAt(tronBytes, offset, segment);
+      if (valueOffset === undefined) {
         state.offsetCache = null;
         return null;
       }
-      if (encoded.type !== ValueType.Arr && encoded.type !== ValueType.Map) {
+      const nextType = readValueTypeAt(tronBytes, valueOffset);
+      if (nextType !== ValueType.Arr && nextType !== ValueType.Map) {
         state.offsetCache = null;
         return null;
       }
-      offset = encoded.offset;
+      offset = valueOffset;
     } else {
       state.offsetCache = null;
       return null;
     }
-    header = readNodeHeader(tronBytes, offset);
   }
-  if (state.kind === "array" && header.keyType !== KeyType.Arr) {
+  const finalType = readValueTypeAt(tronBytes, offset);
+  if (state.kind === "array" && finalType !== ValueType.Arr) {
     state.offsetCache = null;
     return null;
   }
-  if (state.kind === "map" && header.keyType !== KeyType.Map) {
+  if (state.kind === "map" && finalType !== ValueType.Map) {
     state.offsetCache = null;
     return null;
   }
@@ -337,13 +278,13 @@ const decodeValueAt = (
 ): [TronValue, number] => {
   if (offset >= tronBytes.length) throw new Error("tag");
   const tag = tronBytes[offset];
-  const typ = ((tag >>> 5) & 0x07) as ValueType;
+  const typ = (tag & 0x07) as ValueType;
 
   switch (typ) {
     case ValueType.Nil:
       return [null, 1];
     case ValueType.Bit:
-      return [(tag & 0x01) === 1, 1];
+      return [(tag & 0x08) !== 0, 1];
     case ValueType.I64: {
       if (offset + 9 > tronBytes.length) throw new Error("short");
       const value = new DataView(
@@ -366,44 +307,30 @@ const decodeValueAt = (
     case ValueType.F64: {
       if (offset + 9 > tronBytes.length) throw new Error("short");
       return [
-        new DataView(tronBytes.buffer, tronBytes.byteOffset + offset + 1, 8).getFloat64(
-          0,
-          true,
-        ),
+        new DataView(tronBytes.buffer, tronBytes.byteOffset + offset + 1, 8).getFloat64(0, true),
         9,
       ];
     }
     case ValueType.Txt:
-    case ValueType.Bin:
-    case ValueType.Arr:
-    case ValueType.Map: {
-      const { length, headerSize } = readLength(tronBytes, offset);
+    case ValueType.Bin: {
+      const { length, headerSize } = readBytesLength(tronBytes, offset);
       const start = offset + headerSize;
       const end = start + length;
       if (end > tronBytes.length) throw new Error("short");
       const payload = tronBytes.subarray(start, end);
-      switch (typ) {
-        case ValueType.Txt:
-          return [textDecoder.decode(payload), end - offset];
-        case ValueType.Bin:
-          return [payload.slice(), end - offset];
-        case ValueType.Arr:
-        case ValueType.Map: {
-          if (!root || !pathPrefix || pathSegment === null) throw new Error("type");
-          if (length === 0 || length > 4) throw new Error("off");
-          let nodeOffset = 0;
-          for (let i = 0; i < length; i++) {
-            nodeOffset |= payload[i] << (8 * i);
-          }
-          const kind = typ === ValueType.Arr ? "array" : "map";
-          const nextPath = pathPrefix.length
-            ? [...pathPrefix, pathSegment]
-            : [pathSegment];
-          const proxy = getProxyForPath(root, kind, nextPath, nodeOffset >>> 0);
-          return [proxy, end - offset];
-        }
+      if (typ === ValueType.Txt) {
+        return [textDecoder.decode(payload), end - offset];
       }
-      break;
+      return [payload.slice(), end - offset];
+    }
+    case ValueType.Arr:
+    case ValueType.Map: {
+      const header = readNodeHeader(tronBytes, offset);
+      if (!root || !pathPrefix || pathSegment === null) throw new Error("type");
+      const kind = typ === ValueType.Arr ? "array" : "map";
+      const nextPath = pathPrefix.length ? [...pathPrefix, pathSegment] : [pathSegment];
+      const proxy = getProxyForPath(root, kind, nextPath, offset);
+      return [proxy, header.nodeLen];
     }
     default:
       break;
@@ -413,47 +340,44 @@ const decodeValueAt = (
 
 const arrayHasIndexAt = (tronBytes: Uint8Array, offset: number, index: number): boolean => {
   const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Arr) throw new Error("type");
-  const nodeStart = offset + 8;
-  const shift = tronBytes[nodeStart];
-  const bitmap = readUint16LE(tronBytes, nodeStart + 2);
-  if (header.kind === NodeKind.Leaf) {
+  if (header.type !== ValueType.Arr) throw new Error("type");
+  const payloadStart = offset + header.headerSize;
+  const shift = tronBytes[payloadStart];
+  const bitmap = readUint16LE(tronBytes, payloadStart + 1);
+  const addressesStart = payloadStart + 3 + (header.isRoot ? 4 : 0);
+  if (header.isLeaf) {
     const slot = index & 0x0f;
     return ((bitmap >>> slot) & 1) === 1;
   }
   const slot = (index >>> shift) & 0x0f;
   if (((bitmap >>> slot) & 1) === 0) return false;
   const rank = popcount16(bitmap & ((1 << slot) - 1));
-  const childOffset = readUint32LE(tronBytes, nodeStart + 8 + rank * 4);
+  const childOffset = readUint32LE(tronBytes, addressesStart + rank * 4);
   return arrayHasIndexAt(tronBytes, childOffset, index);
 };
 
-const lookupArrayEncodedAt = (
+const lookupArrayValueOffsetAt = (
   tronBytes: Uint8Array,
   offset: number,
   index: number,
-): EncodedValue | undefined => {
+): number | undefined => {
   const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Arr) throw new Error("type");
-  const nodeStart = offset + 8;
-  const shift = tronBytes[nodeStart];
-  const bitmap = readUint16LE(tronBytes, nodeStart + 2);
-  if (header.kind === NodeKind.Leaf) {
+  if (header.type !== ValueType.Arr) throw new Error("type");
+  const payloadStart = offset + header.headerSize;
+  const shift = tronBytes[payloadStart];
+  const bitmap = readUint16LE(tronBytes, payloadStart + 1);
+  const addressesStart = payloadStart + 3 + (header.isRoot ? 4 : 0);
+  if (header.isLeaf) {
     const slot = index & 0x0f;
     if (((bitmap >>> slot) & 1) === 0) return undefined;
     const rank = popcount16(bitmap & ((1 << slot) - 1));
-    let p = nodeStart + 8;
-    for (let i = 0; i < rank; i++) {
-      p += skipValueAt(tronBytes, p);
-    }
-    const [value] = readEncodedValue(tronBytes, p);
-    return value;
+    return readUint32LE(tronBytes, addressesStart + rank * 4);
   }
   const slot = (index >>> shift) & 0x0f;
   if (((bitmap >>> slot) & 1) === 0) return undefined;
   const rank = popcount16(bitmap & ((1 << slot) - 1));
-  const childOffset = readUint32LE(tronBytes, nodeStart + 8 + rank * 4);
-  return lookupArrayEncodedAt(tronBytes, childOffset, index);
+  const childOffset = readUint32LE(tronBytes, addressesStart + rank * 4);
+  return lookupArrayValueOffsetAt(tronBytes, childOffset, index);
 };
 
 const lookupArrayValueAt = (
@@ -464,27 +388,10 @@ const lookupArrayValueAt = (
   pathPrefix: PathSegment[],
   pathSegment: number,
 ): TronValue | undefined => {
-  const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Arr) throw new Error("type");
-  const nodeStart = offset + 8;
-  const shift = tronBytes[nodeStart];
-  const bitmap = readUint16LE(tronBytes, nodeStart + 2);
-  if (header.kind === NodeKind.Leaf) {
-    const slot = index & 0x0f;
-    if (((bitmap >>> slot) & 1) === 0) return undefined;
-    const rank = popcount16(bitmap & ((1 << slot) - 1));
-    let p = nodeStart + 8;
-    for (let i = 0; i < rank; i++) {
-      p += skipValueAt(tronBytes, p);
-    }
-    const [value] = decodeValueAt(tronBytes, p, root, pathPrefix, pathSegment);
-    return value;
-  }
-  const slot = (index >>> shift) & 0x0f;
-  if (((bitmap >>> slot) & 1) === 0) return undefined;
-  const rank = popcount16(bitmap & ((1 << slot) - 1));
-  const childOffset = readUint32LE(tronBytes, nodeStart + 8 + rank * 4);
-  return lookupArrayValueAt(tronBytes, childOffset, index, root, pathPrefix, pathSegment);
+  const valueOffset = lookupArrayValueOffsetAt(tronBytes, offset, index);
+  if (valueOffset === undefined) return undefined;
+  const [value] = decodeValueAt(tronBytes, valueOffset, root, pathPrefix, pathSegment);
+  return value;
 };
 
 const mapHasKeyAt = (
@@ -495,24 +402,25 @@ const mapHasKeyAt = (
   depth: number,
 ): boolean => {
   const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Map) throw new Error("type");
-  const nodeStart = offset + 8;
-  if (header.kind === NodeKind.Leaf) {
-    let p = nodeStart;
-    for (let i = 0; i < header.entryCount; i++) {
-      const [keyVal, keySize] = readEncodedValue(tronBytes, p);
-      if (keyVal.type !== ValueType.Txt || !keyVal.bytes) throw new Error("type");
-      p += keySize;
-      if (bytesEqual(keyVal.bytes, keyBytes)) return true;
-      p += skipValueAt(tronBytes, p);
+  if (header.type !== ValueType.Map) throw new Error("type");
+  const payloadStart = offset + header.headerSize;
+  if (header.isLeaf) {
+    const payloadLen = header.nodeLen - header.headerSize;
+    if (payloadLen % 8 !== 0) throw new Error("len");
+    const entryCount = payloadLen / 8;
+    for (let i = 0; i < entryCount; i++) {
+      const entryPos = payloadStart + i * 8;
+      const keyOffset = readUint32LE(tronBytes, entryPos);
+      const keyBytesAt = readTxtBytesAt(tronBytes, keyOffset);
+      if (bytesEqual(keyBytesAt, keyBytes)) return true;
     }
     return false;
   }
-  const bitmap = readUint16LE(tronBytes, nodeStart);
+  const bitmap = readUint32LE(tronBytes, payloadStart);
   const slot = (hash >>> (depth * 4)) & 0x0f;
   if (((bitmap >>> slot) & 1) === 0) return false;
   const rank = popcount16(bitmap & ((1 << slot) - 1));
-  const childOffset = readUint32LE(tronBytes, nodeStart + 4 + rank * 4);
+  const childOffset = readUint32LE(tronBytes, payloadStart + 4 + rank * 4);
   return mapHasKeyAt(tronBytes, childOffset, keyBytes, hash, depth + 1);
 };
 
@@ -532,36 +440,37 @@ const getKeyHash = (state: MapState, key: string): number => {
   return hash;
 };
 
-const lookupMapEncodedAt = (
+const lookupMapValueOffsetAt = (
   tronBytes: Uint8Array,
   offset: number,
   keyBytes: Uint8Array,
   hash: number,
   depth: number,
-): EncodedValue | undefined => {
+): number | undefined => {
   const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Map) throw new Error("type");
-  const nodeStart = offset + 8;
-  if (header.kind === NodeKind.Leaf) {
-    let p = nodeStart;
-    for (let i = 0; i < header.entryCount; i++) {
-      const [keyVal, keySize] = readEncodedValue(tronBytes, p);
-      if (keyVal.type !== ValueType.Txt || !keyVal.bytes) throw new Error("type");
-      p += keySize;
-      const [value, valueSize] = readEncodedValue(tronBytes, p);
-      p += valueSize;
-      if (bytesEqual(keyVal.bytes, keyBytes)) {
-        return value;
+  if (header.type !== ValueType.Map) throw new Error("type");
+  const payloadStart = offset + header.headerSize;
+  if (header.isLeaf) {
+    const payloadLen = header.nodeLen - header.headerSize;
+    if (payloadLen % 8 !== 0) throw new Error("len");
+    const entryCount = payloadLen / 8;
+    for (let i = 0; i < entryCount; i++) {
+      const entryPos = payloadStart + i * 8;
+      const keyOffset = readUint32LE(tronBytes, entryPos);
+      const valueOffset = readUint32LE(tronBytes, entryPos + 4);
+      const keyBytesAt = readTxtBytesAt(tronBytes, keyOffset);
+      if (bytesEqual(keyBytesAt, keyBytes)) {
+        return valueOffset;
       }
     }
     return undefined;
   }
-  const bitmap = readUint16LE(tronBytes, nodeStart);
+  const bitmap = readUint32LE(tronBytes, payloadStart);
   const slot = (hash >>> (depth * 4)) & 0x0f;
   if (((bitmap >>> slot) & 1) === 0) return undefined;
   const rank = popcount16(bitmap & ((1 << slot) - 1));
-  const childOffset = readUint32LE(tronBytes, nodeStart + 4 + rank * 4);
-  return lookupMapEncodedAt(tronBytes, childOffset, keyBytes, hash, depth + 1);
+  const childOffset = readUint32LE(tronBytes, payloadStart + 4 + rank * 4);
+  return lookupMapValueOffsetAt(tronBytes, childOffset, keyBytes, hash, depth + 1);
 };
 
 const lookupMapValueAt = (
@@ -574,38 +483,10 @@ const lookupMapValueAt = (
   pathPrefix: PathSegment[],
   pathSegment: string,
 ): TronValue | undefined => {
-  const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Map) throw new Error("type");
-  const nodeStart = offset + 8;
-  if (header.kind === NodeKind.Leaf) {
-    let p = nodeStart;
-    for (let i = 0; i < header.entryCount; i++) {
-      const [keyVal, keySize] = readEncodedValue(tronBytes, p);
-      if (keyVal.type !== ValueType.Txt || !keyVal.bytes) throw new Error("type");
-      p += keySize;
-      if (bytesEqual(keyVal.bytes, keyBytes)) {
-        const [value] = decodeValueAt(tronBytes, p, root, pathPrefix, pathSegment);
-        return value;
-      }
-      p += skipValueAt(tronBytes, p);
-    }
-    return undefined;
-  }
-  const bitmap = readUint16LE(tronBytes, nodeStart);
-  const slot = (hash >>> (depth * 4)) & 0x0f;
-  if (((bitmap >>> slot) & 1) === 0) return undefined;
-  const rank = popcount16(bitmap & ((1 << slot) - 1));
-  const childOffset = readUint32LE(tronBytes, nodeStart + 4 + rank * 4);
-  return lookupMapValueAt(
-    tronBytes,
-    childOffset,
-    keyBytes,
-    hash,
-    depth + 1,
-    root,
-    pathPrefix,
-    pathSegment,
-  );
+  const valueOffset = lookupMapValueOffsetAt(tronBytes, offset, keyBytes, hash, depth);
+  if (valueOffset === undefined) return undefined;
+  const [value] = decodeValueAt(tronBytes, valueOffset, root, pathPrefix, pathSegment);
+  return value;
 };
 
 const collectArrayIndices = (
@@ -615,18 +496,19 @@ const collectArrayIndices = (
   out: number[],
 ): void => {
   const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Arr) throw new Error("type");
-  const nodeStart = offset + 8;
-  const shift = tronBytes[nodeStart];
-  const bitmap = readUint16LE(tronBytes, nodeStart + 2);
-  if (header.kind === NodeKind.Leaf) {
+  if (header.type !== ValueType.Arr) throw new Error("type");
+  const payloadStart = offset + header.headerSize;
+  const shift = tronBytes[payloadStart];
+  const bitmap = readUint16LE(tronBytes, payloadStart + 1);
+  const addressesStart = payloadStart + 3 + (header.isRoot ? 4 : 0);
+  if (header.isLeaf) {
     for (let slot = 0; slot < 16; slot++) {
       if (((bitmap >>> slot) & 1) === 0) continue;
       out.push(baseIndex + slot);
     }
     return;
   }
-  let p = nodeStart + 8;
+  let p = addressesStart;
   for (let slot = 0; slot < 16; slot++) {
     if (((bitmap >>> slot) & 1) === 0) continue;
     const childOffset = readUint32LE(tronBytes, p);
@@ -638,27 +520,22 @@ const collectArrayIndices = (
 
 const collectMapKeys = (tronBytes: Uint8Array, offset: number, out: string[]): void => {
   const header = readNodeHeader(tronBytes, offset);
-  if (header.keyType !== KeyType.Map) throw new Error("type");
-  const nodeStart = offset + 8;
-  if (header.kind === NodeKind.Leaf) {
-    let p = nodeStart;
-    for (let i = 0; i < header.entryCount; i++) {
-      if (p >= tronBytes.length) throw new Error("tag");
-      const tag = tronBytes[p];
-      const typ = ((tag >>> 5) & 0x07) as ValueType;
-      if (typ !== ValueType.Txt) throw new Error("type");
-      const { length, headerSize } = readLength(tronBytes, p);
-      const start = p + headerSize;
-      const end = start + length;
-      if (end > tronBytes.length) throw new Error("short");
-      out.push(textDecoder.decode(tronBytes.subarray(start, end)));
-      p = end;
-      p += skipValueAt(tronBytes, p);
+  if (header.type !== ValueType.Map) throw new Error("type");
+  const payloadStart = offset + header.headerSize;
+  if (header.isLeaf) {
+    const payloadLen = header.nodeLen - header.headerSize;
+    if (payloadLen % 8 !== 0) throw new Error("len");
+    const entryCount = payloadLen / 8;
+    for (let i = 0; i < entryCount; i++) {
+      const entryPos = payloadStart + i * 8;
+      const keyOffset = readUint32LE(tronBytes, entryPos);
+      const keyBytes = readTxtBytesAt(tronBytes, keyOffset);
+      out.push(textDecoder.decode(keyBytes));
     }
     return;
   }
-  const bitmap = readUint16LE(tronBytes, nodeStart);
-  let p = nodeStart + 4;
+  const bitmap = readUint32LE(tronBytes, payloadStart);
+  let p = payloadStart + 4;
   for (let slot = 0; slot < 16; slot++) {
     if (((bitmap >>> slot) & 1) === 0) continue;
     const childOffset = readUint32LE(tronBytes, p);
@@ -676,9 +553,9 @@ const getArrayLength = (state: ArrayState): number => {
     return 0;
   }
   const header = readNodeHeader(state.root.tronBytes, offset);
-  if (header.keyType !== KeyType.Arr) throw new Error("type");
-  const nodeStart = offset + 8;
-  const length = readUint32LE(state.root.tronBytes, nodeStart + 4);
+  if (header.type !== ValueType.Arr || !header.isRoot) throw new Error("type");
+  const payloadStart = offset + header.headerSize;
+  const length = readUint32LE(state.root.tronBytes, payloadStart + 3);
   state.lengthCache = length;
   return length;
 };
@@ -710,14 +587,7 @@ const getArrayValue = (state: ArrayState, index: number): TronValue | undefined 
       if (offset === null) {
         value = undefined;
       } else {
-        value = lookupArrayValueAt(
-          state.root.tronBytes,
-          offset,
-          index,
-          state.root,
-          state.path,
-          index,
-        );
+        value = lookupArrayValueAt(state.root.tronBytes, offset, index, state.root, state.path, index);
       }
     }
   }
@@ -996,37 +866,24 @@ const getProxyForPath = (
 export const tron = (tronBytes: Uint8Array, options: ViewOptions = {}): TronProxy => {
   const tronType: TronType = detectType(tronBytes);
   const viewOptions: ViewOptions = { i64: options.i64 ?? "auto" };
-  if (tronType === "scalar") {
-    if (tronBytes.length < 4) throw new Error("short");
-    const tail = tronBytes.subarray(tronBytes.length - 4);
-    if (
-      tail[0] !== SCALAR_MAGIC[0] ||
-      tail[1] !== SCALAR_MAGIC[1] ||
-      tail[2] !== SCALAR_MAGIC[2] ||
-      tail[3] !== SCALAR_MAGIC[3]
-    ) {
-      throw new Error("type");
-    }
-    const payload = tronBytes.subarray(0, tronBytes.length - 4);
-    const root: RootState = { tronBytes, options: viewOptions, version: 0, proxyCache: new Map() };
-    const [value, size] = decodeValueAt(payload, 0, root, null, null);
-    if (size !== payload.length) throw new Error("extra");
-    return value as TronProxy;
-  }
-
   const rootState: RootState = {
     tronBytes,
     options: viewOptions,
     version: 0,
     proxyCache: new Map(),
   };
-
   const rootOffset = getRootOffset(tronBytes);
-  const header = readNodeHeader(tronBytes, rootOffset);
-  if (header.keyType === KeyType.Arr) {
+
+  if (tronType === "scalar") {
+    const [value] = decodeValueAt(tronBytes, rootOffset, rootState, null, null);
+    return value as TronProxy;
+  }
+
+  const type = readValueTypeAt(tronBytes, rootOffset);
+  if (type === ValueType.Arr) {
     return getProxyForPath(rootState, "array", [], rootOffset);
   }
-  if (header.keyType === KeyType.Map) {
+  if (type === ValueType.Map) {
     return getProxyForPath(rootState, "map", [], rootOffset);
   }
   throw new Error("type");

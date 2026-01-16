@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
-    "bench": "bun run bench/geojson.ts"
+    "bench": "bun run bench/geojson.ts",
+    "update:tron-shared": "git -C tron-shared fetch origin && git -C tron-shared checkout origin/main"
   }
 }

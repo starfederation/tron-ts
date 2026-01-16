@@ -96,10 +96,10 @@ describe("tron proxy", () => {
     const updatedJson = (tron(updated) as { ToJSON: () => string }).ToJSON();
     expect(vacuumJson).toBe(updatedJson);
     const prevOffset =
-      vacuumed[vacuumed.length - 8] |
-      (vacuumed[vacuumed.length - 7] << 8) |
-      (vacuumed[vacuumed.length - 6] << 16) |
-      (vacuumed[vacuumed.length - 5] << 24);
+      vacuumed[vacuumed.length - 4] |
+      (vacuumed[vacuumed.length - 3] << 8) |
+      (vacuumed[vacuumed.length - 2] << 16) |
+      (vacuumed[vacuumed.length - 1] << 24);
     expect(prevOffset).toBe(0);
   });
 
@@ -114,10 +114,10 @@ describe("tron proxy", () => {
     const canonFromJson = fromJSON((tron(updated) as { ToJSON: () => string }).ToJSON());
     expectBytesEqual(canon, canonFromJson);
     const prevOffset =
-      canon[canon.length - 8] |
-      (canon[canon.length - 7] << 8) |
-      (canon[canon.length - 6] << 16) |
-      (canon[canon.length - 5] << 24);
+      canon[canon.length - 4] |
+      (canon[canon.length - 3] << 8) |
+      (canon[canon.length - 2] << 16) |
+      (canon[canon.length - 1] << 24);
     expect(prevOffset).toBe(0);
   });
 });
